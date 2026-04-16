@@ -838,8 +838,7 @@ void setup() {
     IPAddress apIP = WiFi.localIP();
     Serial.print("   AP IP: ");
     Serial.println(apIP);
-    Serial.print("   Web Interface: http://");
-    Serial.println(apIP);
+    Serial.println("   Web Interface: http://192.168.1.1");
 
     // 启动Web服务器
     server.begin();
