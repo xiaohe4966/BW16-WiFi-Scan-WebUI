@@ -287,35 +287,51 @@ void sendJSON(WiFiClient& client, const String& json) {
 // Web服务器 - 主处理函数（参考xiaohe4966/BW16-WebControl风格）
 // ============================================================
 void handleClient(WiFiClient& client) {
-    // 等待客户端发送请求
-    while (client.connected() && !client.available()) {
-        delay(1);
-    }
-
-    if (!client.available()) {
-        client.stop();
-        return;
-    }
-
-    // 读取请求行
-    String line = client.readStringUntil('\n');
-    line.trim();
-
-    // 解析 GET 请求路径
+    // 逐字符读取HTTP请求（参考BW16-WebControl，避免readStringUntil兼容问题）
+    String currentLine = "";
     String path = "";
-    if (line.startsWith("GET ")) {
-        int space1 = 4;
-        int space2 = line.indexOf(' ', space1);
-        if (space2 > space1) {
-            path = line.substring(space1, space2);
+    String action = "";
+    bool pathParsed = false;
+    unsigned long timeout = millis() + 2000;  // 2秒超时
+
+    while (client.connected() && millis() < timeout) {
+        if (!client.available()) {
+            delay(1);
+            continue;
+        }
+
+        char c = client.read();
+        if (c == '\n') {
+            if (currentLine.length() == 0) break;  // 空行=Header结束
+            // 解析第一行（GET /path HTTP/1.1）
+            if (!pathParsed && currentLine.startsWith("GET ")) {
+                int space1 = 4;
+                int space2 = currentLine.indexOf(' ', space1);
+                if (space2 > space1) {
+                    path = currentLine.substring(space1, space2);
+                }
+                pathParsed = true;
+                Serial.print("[HTTP] ");
+                Serial.println(path);
+            }
+            currentLine = "";
+        } else if (c != '\r') {
+            currentLine += c;
         }
     }
 
-    // 读取剩余Header（直到空行）
-    while (client.connected() && client.available()) {
-        line = client.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0) break;
+    // 从path解析action
+    if (path.startsWith("/api")) {
+        int q = path.indexOf('?');
+        if (q >= 0) {
+            String qs = path.substring(q + 1);
+            int eq = qs.indexOf('=');
+            if (eq > 0) {
+                action = qs.substring(eq + 1);
+                int amp = action.indexOf('&');
+                if (amp > 0) action = action.substring(0, amp);
+            }
+        }
     }
 
     // 路由处理
@@ -323,15 +339,6 @@ void handleClient(WiFiClient& client) {
         sendHTML(client);
     }
     else if (path.startsWith("/api")) {
-        String action = "";
-        int q = path.indexOf('?');
-        if (q >= 0) {
-            String qs = path.substring(q + 1);
-            int eq = qs.indexOf('=');
-            if (eq > 0) action = qs.substring(eq + 1);
-            int amp = action.indexOf('&');
-            if (amp > 0) action = action.substring(0, amp);
-        }
         handleAPI(client, action, path);
     }
     else if (path == "/status") {
@@ -349,7 +356,6 @@ void handleClient(WiFiClient& client) {
         client.print("Not Found");
     }
 
-    delay(5);
     client.stop();
 }
 
@@ -823,22 +829,33 @@ void setup() {
     Serial.println("  by Ghost - WiFi AP Mode (无屏幕)");
     Serial.println("========================================");
 
-    // 启动AP（AmebaD apbegin 返回值不可靠，不用判断）
+    // 启动AP（参考BW16-WebControl的判断方式）
     Serial.println("[*] Starting WiFi AP...");
-    WiFi.apbegin(AP_SSID, AP_PASS, AP_CHANNEL);
-    delay(2000); // 等待AP完全启动
+    int apStatus = WiFi.apbegin(AP_SSID, AP_PASS, AP_CHANNEL);
+    Serial.print("[*] apbegin ret="); Serial.println(apStatus);
+    Serial.print("[*] WL_CONNECTED="); Serial.println((int)WL_CONNECTED);
 
-    status.ap_ok = true;
-    Serial.println("✅ WiFi AP started!");
-    Serial.print("   SSID: "); Serial.println(AP_SSID);
-    Serial.print("   Password: "); Serial.println(AP_PASS);
-    Serial.print("   Channel: "); Serial.println(AP_CHANNEL);
+    delay(2000);
 
-    // 打印实际AP IP（用于确认访问地址）
     IPAddress apIP = WiFi.localIP();
-    Serial.print("   AP IP: ");
-    Serial.println(apIP);
-    Serial.println("   Web Interface: http://192.168.1.1");
+    Serial.print("[*] localIP=");
+    Serial.print((int)apIP[0]); Serial.print(".");
+    Serial.print((int)apIP[1]); Serial.print(".");
+    Serial.print((int)apIP[2]); Serial.print(".");
+    Serial.println((int)apIP[3]);
+
+    if (apIP[0] != 0) {
+        status.ap_ok = true;
+        Serial.println("✅ WiFi AP started!");
+        Serial.print("   SSID: "); Serial.println(AP_SSID);
+        Serial.print("   Password: "); Serial.println(AP_PASS);
+        Serial.print("   Channel: "); Serial.println(AP_CHANNEL);
+        Serial.print("   AP IP: "); Serial.println(apIP);
+        Serial.println("   Web Interface: http://192.168.1.1");
+    } else {
+        Serial.println("❌ WiFi AP failed! (IP=0.0.0.0)");
+        // 不阻塞，继续尝试
+    }
 
     // 启动Web服务器
     server.begin();
@@ -858,6 +875,7 @@ void loop() {
     if (client) {
         handleClient(client);
     }
+    delay(10);
 
     // 每10分钟自动扫描更新（后台静默）
     if (millis() - lastScanTime >= SCAN_INTERVAL) {
