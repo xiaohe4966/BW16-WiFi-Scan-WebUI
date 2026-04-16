@@ -1,0 +1,13 @@
+# Prerequisites
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.d
+*.lst
+
+# IDE
+.vscode/
+.pio/
+build/
