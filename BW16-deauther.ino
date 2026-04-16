@@ -295,6 +295,7 @@ void sendJSON(WiFiClient& client, const String& json) {
     client.println("Connection: close\r\n");
     client.println();
     client.print(json);
+    client.flush();  // 等待数据完全发送出去再断开
 }
 
 // ============================================================
@@ -368,6 +369,7 @@ void handleClient(WiFiClient& client) {
         client.println("Connection: close\r\n");
         client.println();
         client.print("Not Found");
+        client.flush();
     }
 
     client.stop();
@@ -676,6 +678,7 @@ function pollStatus() {
             renderList();
         }
     }).catch(function(){});
+    client.flush();
 }
 
 let wifiData = [];
