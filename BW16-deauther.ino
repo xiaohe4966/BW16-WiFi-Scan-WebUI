@@ -288,14 +288,42 @@ void attackTask(const String& mode) {
 // Web服务器 - HTTP工具函数
 // ============================================================
 void sendJSON(WiFiClient& client, const String& json) {
+    // 用write确保数据被正确发送
+    const char* s = json.c_str();
+    int len = strlen(s);
+
+    Serial.print("[JSON] len=");
+    Serial.print(len);
+    Serial.print(" data=");
+    Serial.println(json);
+
     client.print("HTTP/1.1 200 OK\r\n");
     client.print("Content-Type: application/json\r\n");
+    client.print("Connection: close\r\n");
     client.print("Content-Length: ");
-    client.println(json.length());
-    client.println("Connection: close\r\n");
+    client.println(len);
     client.println();
-    client.print(json);
-    client.flush();  // 等待数据完全发送出去再断开
+
+    // 分块发送，每块64字节，确保每次都检查返回值
+    int sent = 0;
+    while (sent < len) {
+        int chunk = len - sent;
+        if (chunk > 64) chunk = 64;
+        int n = client.write((const uint8_t*)(s + sent), chunk);
+        if (n <= 0) {
+            Serial.println("[JSON] write error, breaking");
+            break;
+        }
+        sent += n;
+    }
+    Serial.print("[JSON] sent total: ");
+    Serial.println(sent);
+
+    // 等待数据真正到达TCP缓冲区
+    for (int i = 0; i < 10; i++) {
+        client.flush();
+        delay(10);
+    }
 }
 
 // ============================================================
