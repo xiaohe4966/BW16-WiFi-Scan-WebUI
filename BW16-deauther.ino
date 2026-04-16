@@ -107,6 +107,20 @@ int scanNetworks() {
     if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
         delay(5000);
         Serial.println(" Done!");
+        Serial.print("[*] Networks found: ");
+        Serial.println(scan_results.size());
+        for (size_t i = 0; i < scan_results.size(); i++) {
+            Serial.print("  [");
+            Serial.print(i);
+            Serial.print("] ");
+            Serial.print(scan_results[i].ssid);
+            Serial.print(" (");
+            Serial.print(scan_results[i].bssid_str);
+            Serial.print(") Ch:");
+            Serial.print(scan_results[i].channel);
+            Serial.print(" RSSI:");
+            Serial.println(scan_results[i].rssi);
+        }
         status.scan_count++;
         return 0;
     } else {
@@ -468,6 +482,9 @@ void sendStatusJSON(WiFiClient& client) {
 }
 
 void sendNetworksJSON(WiFiClient& client) {
+    Serial.print("[NETWORKS] Sending networks: count=");
+    Serial.println(scan_results.size());
+
     String json = "[";
     for (size_t i = 0; i < scan_results.size(); i++) {
         if (i > 0) json += ",";
@@ -478,6 +495,10 @@ void sendNetworksJSON(WiFiClient& client) {
         json += ",\"rssi\":" + String(scan_results[i].rssi) + "}";
     }
     json += "]";
+
+    Serial.print("[NETWORKS] JSON: ");
+    Serial.println(json);
+
     sendJSON(client, json);
 }
 
