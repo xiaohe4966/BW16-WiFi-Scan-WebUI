@@ -117,6 +117,9 @@ static uint16_t capture_len[CAPTURE_BUF_FRAMES];
 static uint32_t capture_ts[CAPTURE_BUF_FRAMES];
 static int capture_head = 0;
 static int capture_tail = 0;
+static volatile bool capture_running = false;
+static uint8_t capture_bssid[6] = {0};
+static int capture_channel = 1;
 static volatile int capture_eapol_count = 0;
 static volatile bool capture_has_handshake = false;
 static volatile int capture_last_eapol = 0;  // 上次循环的EAPOL计数，用于检测新包
@@ -125,7 +128,7 @@ static int capture_target_index = -1;
 static uint8_t capture_radio_len[CAPTURE_BUF_FRAMES];  // 每帧的radiotap头长度
 
 // 抓包回调（最小化ISR中操作，避免print等阻塞调用）
-void capture_promisc_callback(unsigned char* buffer, unsigned int len, void* user_data) {
+void capture_promisc_callback(unsigned char* buffer, unsigned int len, void* /*user_data*/) {
     if (!capture_running || len < 26) return;
 
     // Radiotap header: 前2字节=length字段
@@ -228,7 +231,7 @@ bool captureStart(int target_idx) {
     capture_start_ms = millis();
 
     // 开启混杂模式 level=3 (所有802.11帧)
-    int ret = wifi_set_promisc(RTW_PROMISC_LEVEL_3, capture_promisc_callback, 1);
+    int ret = wifi_set_promisc(3, capture_promisc_callback, 1);
     if (ret != RTW_SUCCESS) {
         Serial.print("[CAP] promisc failed: ");
         Serial.println(ret);
@@ -244,7 +247,7 @@ bool captureStart(int target_idx) {
 void captureStop() {
     if (!capture_running) return;
     capture_running = false;
-    wifi_set_promisc(RTW_PROMISC_LEVEL_DISABLE, NULL, 0);
+    wifi_set_promisc(0, NULL, 0);
     Serial.print("[CAP] Stopped. EAPOL=");
     Serial.print(capture_eapol_count);
     Serial.print(" frames=");
@@ -328,6 +331,7 @@ int buildPcapPacket(uint8_t* out, int max_out) {
 
 // 切换到指定信道
 extern "C" int wifi_set_channel(int channel);
+extern "C" int wifi_set_promisc(unsigned long enabled, void (*callback)(unsigned char*, unsigned int, void*), unsigned char len_used);
 
 // ============================================================
 // 原有WiFi扫描逻辑（保持不变）
