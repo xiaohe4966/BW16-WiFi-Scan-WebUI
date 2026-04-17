@@ -256,80 +256,6 @@ void captureStop() {
 }
 
 // 生成PCAP到缓冲区（返回pcap数据总大小）
-int buildPcapPacket(uint8_t* out, int max_out) {
-    int offset = 0;
-
-    // PCAP全局头
-    if (offset + 24 > max_out) return offset;
-    memcpy(out + offset, PCAP_GLOBAL_HDR, 24);
-    offset += 24;
-
-    int frames_stored = 0;
-    int cap_tail = capture_tail;
-    while (cap_tail < capture_head && frames_stored < CAPTURE_BUF_FRAMES) {
-        int idx = cap_tail % CAPTURE_BUF_FRAMES;
-        uint16_t frame_len = capture_len[idx];
-        uint32_t ts = capture_ts[idx];
-        uint8_t* frame_data = capture_buf[idx];
-
-        // 写入包头 (Radiotap + IEEE 802.11)
-        int radio_len = 12;
-        int ieee_len = frame_len - 12;
-        int pkt_record_len = 16 + radio_len + ieee_len; // pkt_hdr + radio + ieee
-
-        if (offset + pkt_record_len > max_out) break;
-
-        // 包头：时间戳
-        uint32_t sec = ts / 1000;
-        uint32_t usec = (ts % 1000) * 1000;
-        out[offset++] = sec & 0xFF;
-        out[offset++] = (sec >> 8) & 0xFF;
-        out[offset++] = (sec >> 16) & 0xFF;
-        out[offset++] = (sec >> 24) & 0xFF;
-        out[offset++] = usec & 0xFF;
-        out[offset++] = (usec >> 8) & 0xFF;
-        out[offset++] = (usec >> 16) & 0xFF;
-        out[offset++] = (usec >> 24) & 0xFF;
-        // 写入包长
-        uint16_t pkt_len = radio_len + ieee_len;
-        out[offset++] = pkt_len & 0xFF;
-        out[offset++] = (pkt_len >> 8) & 0xFF;
-        out[offset++] = (pkt_len >> 16) & 0xFF;
-        out[offset++] = (pkt_len >> 24) & 0xFF;
-        // orig_len
-        out[offset++] = pkt_len & 0xFF;
-        out[offset++] = (pkt_len >> 8) & 0xFF;
-        out[offset++] = (pkt_len >> 16) & 0xFF;
-        out[offset++] = (pkt_len >> 24) & 0xFF;
-
-        // Radiotap header (用原始的radiotap头，或生成简化版)
-        uint8_t rlen = capture_radio_len[idx];
-        if (rlen > 0 && rlen <= 64) {
-            // 复制原始radiotap头（修改signal字节）
-            memcpy(out + offset, frame_data, rlen);
-            // Radiotap signal在偏移8处(dBm)
-            int8_t signal = -60;
-            out[offset + 8] = (uint8_t)signal;
-            offset += rlen;
-        } else {
-            // 生成简化radiotap头
-            memcpy(out + offset, RADIO_HDR, 12);
-            int8_t signal = -60;
-            out[offset + 8] = (uint8_t)signal;
-            offset += 12;
-        }
-
-        // IEEE 802.11 frame (从radiotap头之后开始)
-        memcpy(out + offset, frame_data + rlen, ieee_len);
-        offset += ieee_len;
-
-        cap_tail++;
-        frames_stored++;
-    }
-
-    return offset;
-}
-
 // 切换到指定信道
 extern "C" int wifi_set_channel(int channel);
 extern "C" int wifi_set_promisc(unsigned long enabled, void (*callback)(unsigned char*, unsigned int, void*), unsigned char len_used);
@@ -649,36 +575,78 @@ void handleClient(WiFiClient& client) {
         sendNetworksJSON(client);
     }
     else if (path == "/capture.pcap" || path.startsWith("/capture.pcap?")) {
-        // 下载PCAP文件
-        if (capture_head == capture_tail) {
+        // 流式下载PCAP文件（不缓冲整个文件）
+        int frame_count = capture_head - capture_tail;
+        if (frame_count <= 0) {
             client.print("HTTP/1.1 204 No Content\r\n");
             client.print("Connection: close\r\n");
             client.println("\r\n");
         } else {
-            static uint8_t pcap_buf[65536];
-            int pcap_len = buildPcapPacket(pcap_buf, sizeof(pcap_buf));
-            Serial.print("[PCAP] download: ");
-            Serial.print(pcap_len);
+            // 计算总大小：24字节全局头 + 每帧(16字节包头 + radiotap + 帧数据)
+            int total_size = 24;  // PCAP global header
+            int cap_tail = capture_tail;
+            while (cap_tail < capture_head) {
+                int idx = cap_tail % CAPTURE_BUF_FRAMES;
+                total_size += 16 + capture_len[idx];  // packet header + frame data
+                cap_tail++;
+            }
+            
+            Serial.print("[PCAP] streaming: ");
+            Serial.print(frame_count);
+            Serial.print(" frames, ");
+            Serial.print(total_size);
             Serial.println(" bytes");
 
+            // 发送HTTP头
             client.print("HTTP/1.1 200 OK\r\n");
             client.print("Content-Type: application/octet-stream\r\n");
             client.print("Content-Disposition: attachment; filename=capture.pcap\r\n");
             client.print("Content-Length: ");
-            client.println(pcap_len);
+            client.println(total_size);
             client.print("Connection: close\r\n");
             client.println("\r\n");
 
-            // 分块发送
-            int sent = 0;
-            while (sent < pcap_len) {
-                int chunk = pcap_len - sent;
-                if (chunk > 256) chunk = 256;
-                int n = client.write(pcap_buf + sent, chunk);
-                if (n <= 0) break;
-                sent += n;
+            // 发送PCAP全局头（24字节）
+            client.write(PCAP_GLOBAL_HDR, 24);
+
+            // 逐帧发送
+            cap_tail = capture_tail;
+            while (cap_tail < capture_head) {
+                int idx = cap_tail % CAPTURE_BUF_FRAMES;
+                uint16_t frame_len = capture_len[idx];
+                uint32_t ts = capture_ts[idx];
+                uint8_t* frame_data = capture_buf[idx];
+                uint8_t rlen = capture_radio_len[idx];
+
+                // 构造并发送包头的16字节
+                uint8_t pkt_hdr[16];
+                uint32_t ts_sec = ts / 1000;
+                uint32_t ts_usec = (ts % 1000) * 1000;
+                uint32_t incl_len = frame_len;
+                uint32_t orig_len = frame_len;
+                
+                memcpy(pkt_hdr, &ts_sec, 4);
+                memcpy(pkt_hdr + 4, &ts_usec, 4);
+                memcpy(pkt_hdr + 8, &incl_len, 4);
+                memcpy(pkt_hdr + 12, &orig_len, 4);
+                
+                client.write(pkt_hdr, 16);
+
+                // 发送帧数据（radiotap + ieee frame）
+                // 分块发送避免TCP缓冲区问题
+                int sent = 0;
+                while (sent < frame_len) {
+                    int chunk = frame_len - sent;
+                    if (chunk > 128) chunk = 128;
+                    int n = client.write(frame_data + sent, chunk);
+                    if (n <= 0) break;
+                    sent += n;
+                }
+                
+                cap_tail++;
             }
             client.flush();
+            Serial.println("[PCAP] done");
         }
     }
     else {
