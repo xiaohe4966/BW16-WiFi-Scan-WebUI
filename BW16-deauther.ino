@@ -111,8 +111,9 @@ static const uint8_t RADIO_HDR[] = {
 };
 
 // 环形缓冲区存原始帧
-#define CAPTURE_BUF_FRAMES 128
-static uint8_t capture_buf[CAPTURE_BUF_FRAMES][2048];
+#define CAPTURE_BUF_FRAMES 16
+#define CAPTURE_FRAME_SIZE 256
+static uint8_t capture_buf[CAPTURE_BUF_FRAMES][CAPTURE_FRAME_SIZE];
 static uint16_t capture_len[CAPTURE_BUF_FRAMES];
 static uint32_t capture_ts[CAPTURE_BUF_FRAMES];
 static int capture_head = 0;
@@ -183,7 +184,7 @@ void capture_promisc_callback(unsigned char* buffer, unsigned int len, void* /*u
     // 存到环形缓冲区（最小化操作）
     int idx = capture_head % CAPTURE_BUF_FRAMES;
     int frame_total = radio_len + len;
-    if (frame_total > 2048) frame_total = 2048;
+    if (frame_total > CAPTURE_FRAME_SIZE) frame_total = CAPTURE_FRAME_SIZE;
     capture_radio_len[idx] = radio_len;
     memcpy(capture_buf[idx], buffer, frame_total);
     capture_len[idx] = frame_total;
@@ -654,7 +655,7 @@ void handleClient(WiFiClient& client) {
             client.print("Connection: close\r\n");
             client.println("\r\n");
         } else {
-            uint8_t pcap_buf[65536];
+            static uint8_t pcap_buf[65536];
             int pcap_len = buildPcapPacket(pcap_buf, sizeof(pcap_buf));
             Serial.print("[PCAP] download: ");
             Serial.print(pcap_len);
